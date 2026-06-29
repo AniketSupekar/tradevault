@@ -4,6 +4,8 @@ import com.tradevault.order_service.dto.PlaceOrderRequest;
 import com.tradevault.order_service.entity.Order;
 import com.tradevault.order_service.entity.OrderStatus;
 import com.tradevault.order_service.exception.DuplicateOrderException;
+import com.tradevault.order_service.kafka.OrderEventProducer;
+import com.tradevault.order_service.kafka.OrderPlacedEvent;
 import com.tradevault.order_service.repository.OrderRepository;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
@@ -15,17 +17,16 @@ import java.util.Optional;
 public class OrderService {
 
     private final OrderRepository orderRepository;
+    private final OrderEventProducer orderEventProducer;
 
-    public OrderService(OrderRepository orderRepository) {
+    public OrderService(OrderRepository orderRepository, OrderEventProducer orderEventProducer) {
         this.orderRepository = orderRepository;
+        this.orderEventProducer = orderEventProducer;
     }
 
     @Transactional
     public Order placeOrder(PlaceOrderRequest request) {
 
-        // Optional fast-path check — not the real guarantee, just avoids
-        // unnecessary work on obvious repeat calls. The DB constraint below
-        // is what actually prevents the race condition.
         Optional<Order> existing = orderRepository.findByIdempotencyKey(request.getIdempotencyKey());
         if (existing.isPresent()) {
             return existing.get();
@@ -41,15 +42,26 @@ public class OrderService {
         order.setLimitPrice(request.getLimitPrice());
         order.setStatus(OrderStatus.PLACED);
 
+        Order saved;
         try {
-            return orderRepository.save(order);
+            saved = orderRepository.save(order);
         } catch (DataIntegrityViolationException e) {
-            // Two requests raced past the check above at the same time.
-            // The DB's unique constraint on idempotency_key rejected the
-            // second insert — this is the real safety net.
             return orderRepository.findByIdempotencyKey(request.getIdempotencyKey())
                     .orElseThrow(() -> new DuplicateOrderException(
                             "Duplicate order detected but original could not be found"));
         }
+
+        OrderPlacedEvent event = new OrderPlacedEvent(
+                saved.getId(),
+                saved.getUserId(),
+                saved.getSymbol(),
+                saved.getSide(),
+                saved.getQuantity(),
+                saved.getLimitPrice(),
+                saved.getIdempotencyKey()
+        );
+        orderEventProducer.publish(event);
+
+        return saved;
     }
 }
